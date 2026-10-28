@@ -2,7 +2,6 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const { Chess } = require('chess.js');
-const stockfish = require('stockfish');
 const axios = require('axios');
 
 const PORT = process.env.PORT || 3000;
@@ -53,114 +52,7 @@ setInterval(async () => {
 }, 10 * 60 * 1000); // Mỗi 10 phút
 
 // ==========================================
-// 2. KHỞI TẠO STOCKFISH AN TOÀN (CHỐNG LỖI TYPEERROR)
-// ==========================================
-let engine = null;
-try {
-    engine = typeof stockfish === 'function' ? stockfish() : stockfish;
-    if (engine && typeof engine.postMessage === 'function') {
-        engine.postMessage('uci');
-        engine.postMessage('setoption name Threads value 1');
-        engine.postMessage('setoption name Hash value 8');
-        engine.postMessage('isready');
-        console.log('[Stockfish] Initialized successfully.');
-    }
-} catch (e) {
-    console.warn('[Stockfish Warning] Engine could not be initialized:', e.message);
-}
-
-// Hàm đánh giá FEN an toàn (Không làm sập server nếu engine gặp sự cố)
-function getFenScore(fen) {
-    return new Promise((resolve) => {
-        if (!engine || typeof engine.postMessage !== 'function') {
-            return resolve(0); // Trả về điểm trung lập nếu không dùng được engine
-        }
-
-        let lastScore = 0;
-        let resolved = false;
-
-        const onMessage = (event) => {
-            const line = typeof event === 'object' ? event.data : event;
-            if (typeof line === 'string') {
-                if (line.includes('score cp')) {
-                    const match = line.match(/score cp (-?\d+)/);
-                    if (match) lastScore = parseInt(match[1], 10);
-                } else if (line.includes('score mate')) {
-                    const match = line.match(/score mate (-?\d+)/);
-                    if (match) {
-                        const mateIn = parseInt(match[1], 10);
-                        lastScore = mateIn > 0 ? 10000 - mateIn : -10000 - mateIn;
-                    }
-                } else if (line.startsWith('bestmove')) {
-                    cleanup();
-                    resolve(lastScore);
-                }
-            }
-        };
-
-        const cleanup = () => {
-            if (!resolved) {
-                resolved = true;
-                if (engine.removeListener) engine.removeListener('message', onMessage);
-            }
-        };
-
-        if (engine.on) engine.on('message', onMessage);
-        else if (engine.onmessage !== undefined) engine.onmessage = onMessage;
-
-        try {
-            engine.postMessage(`position fen ${fen}`);
-            engine.postMessage(`go depth 6`);
-        } catch (err) {
-            cleanup();
-            resolve(0);
-        }
-
-        // Timeout phòng hờ trường hợp engine phản hồi chậm
-        setTimeout(() => {
-            cleanup();
-            resolve(lastScore);
-        }, 1500);
-    });
-}
-
-// Phân loại nước đi theo chuẩn Chess.com
-async function classifyMove(gameBefore, moveObject, plyCount) {
-    if (plyCount <= 8) {
-        return { classification: "Book", description: "Nước đi khai cuộc chuẩn" };
-    }
-
-    const fenBefore = gameBefore.fen();
-    const tempGame = new Chess(fenBefore);
-    const turn = tempGame.turn();
-
-    const prevScore = await getFenScore(fenBefore);
-    tempGame.move(moveObject);
-    const fenAfter = tempGame.fen();
-    const newScore = await getFenScore(fenAfter);
-
-    let diff = (turn === 'w') ? (newScore - prevScore) : (prevScore - newScore);
-
-    let classification = "Good";
-    if (diff >= 150 && (moveObject.captured || moveObject.san.includes('+'))) {
-        classification = "Brilliant";
-    } else if (diff >= 50) {
-        classification = "Great Find";
-    } else if (diff >= -20) {
-        classification = "Best";
-    } else if (diff >= -80) {
-        classification = "Inaccuracy";
-    } else if (diff >= -200) {
-        classification = "Mistake";
-    } else {
-        classification = "Blunder";
-    }
-
-    return { classification, centipawnChange: diff };
-}
-
-// ==========================================
-// 3. MATCHMAKING & SOCKET.IO REALTIME
+// 2. MATCHMAKING & SOCKET.IO REALTIME
 // ==========================================
 let waitingPlayer = null;
 const rooms = new Map();
@@ -212,7 +104,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('make_move', async (data) => {
+    socket.on('make_move', (data) => {
         const { roomId, move } = data;
         const room = rooms.get(roomId);
 
@@ -225,8 +117,6 @@ io.on('connection', (socket) => {
             return socket.emit('error_message', 'Chưa tới lượt của bạn!');
         }
 
-        const gameBefore = new Chess(game.fen());
-
         let moveResult = null;
         try {
             moveResult = game.move(move);
@@ -238,16 +128,13 @@ io.on('connection', (socket) => {
             return socket.emit('invalid_move', { message: 'Nước đi không hợp lệ!', currentFen: game.fen() });
         }
 
-        const plyCount = game.history().length;
-        const evaluation = await classifyMove(gameBefore, moveResult, plyCount);
-
+        // Bắn thông báo nước đi thành công kèm theo FEN hiện tại để client tự chấm điểm
         io.to(roomId).emit('move_made', {
             move: moveResult,
             fen: game.fen(),
             turn: game.turn(),
             isCheck: game.inCheck(),
-            isGameOver: game.isGameOver(),
-            evaluation
+            isGameOver: game.isGameOver()
         });
 
         if (game.isGameOver()) {
