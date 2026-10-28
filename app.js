@@ -8,9 +8,7 @@ const axios = require('axios');
 const PORT = process.env.PORT || 3000;
 const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 
-// ==========================================
-// URL RAW CỦA GITHUB GIST (GẮN TRỰC TIẾP TẠI ĐÂY)
-// ==========================================
+// URL Raw của GitHub Gist chứa giao diện HTML của bạn
 const GIST_HTML_URL = 'https://gist.githubusercontent.com/opfkdr-gif/493574c699b41d7f35d5ce1da158a7db/raw/5ef6f4ea7399ee2265dd245b01b926300c8fa322/gistfile1.txt';
 
 const app = express();
@@ -22,7 +20,7 @@ const io = new Server(server, {
 app.use(express.json());
 
 // ==========================================
-// 0. TRANG DEFAULT: TẢI HTML TRỰC TIẾP TỪ GIST ĐÃ ĐẶT SẴN
+// 0. TRANG DEFAULT: TẢI HTML TRỰC TIẾP TỪ GIST
 // ==========================================
 app.get('/', async (req, res) => {
     try {
@@ -34,7 +32,6 @@ app.get('/', async (req, res) => {
         res.status(500).send(`
             <h2>Không thể tải giao diện từ GitHub Gist!</h2>
             <p>Lỗi: ${err.message}</p>
-            <p>Vui lòng kiểm tra lại biến <code>GIST_HTML_URL</code> trong file <code>app.js</code> của bạn.</p>
         `);
     }
 });
@@ -56,99 +53,78 @@ setInterval(async () => {
 }, 10 * 60 * 1000); // Mỗi 10 phút
 
 // ==========================================
-// 2. STOCKFISH ENGINE AN TOÀN (CHỐNG LỖI API & OOM)
+// 2. KHỞI TẠO STOCKFISH AN TOÀN (CHỐNG LỖI TYPEERROR)
 // ==========================================
-let engine;
+let engine = null;
 try {
-    engine = stockfish();
-} catch (e) {
-    console.error('[Stockfish Init Error]:', e.message);
-}
-
-// Hàm gửi lệnh linh hoạt tương thích với mọi phiên bản gói stockfish
-const sendEngineCommand = (cmd) => {
-    if (!engine) return;
-    if (typeof engine.postMessage === 'function') {
-        engine.postMessage(cmd);
-    } else if (typeof engine.send === 'function') {
-        engine.send(cmd);
-    } else if (typeof engine.write === 'function') {
-        engine.write(cmd + '\n');
-    } else {
-        console.warn('[Stockfish] Không tìm thấy phương thức gửi lệnh hợp lệ.');
+    engine = typeof stockfish === 'function' ? stockfish() : stockfish;
+    if (engine && typeof engine.postMessage === 'function') {
+        engine.postMessage('uci');
+        engine.postMessage('setoption name Threads value 1');
+        engine.postMessage('setoption name Hash value 8');
+        engine.postMessage('isready');
+        console.log('[Stockfish] Initialized successfully.');
     }
-};
-
-if (engine) {
-    sendEngineCommand('uci');
-    sendEngineCommand('setoption name Threads value 1');
-    sendEngineCommand('setoption name Hash value 8');
-    sendEngineCommand('isready');
+} catch (e) {
+    console.warn('[Stockfish Warning] Engine could not be initialized:', e.message);
 }
 
+// Hàm đánh giá FEN an toàn (Không làm sập server nếu engine gặp sự cố)
 function getFenScore(fen) {
     return new Promise((resolve) => {
-        if (!engine) {
-            return resolve(0);
+        if (!engine || typeof engine.postMessage !== 'function') {
+            return resolve(0); // Trả về điểm trung lập nếu không dùng được engine
         }
 
         let lastScore = 0;
         let resolved = false;
 
-        const handleMessage = (data) => {
-            const line = typeof data === 'object' && data !== null ? (data.data || JSON.stringify(data)) : String(data);
-
-            if (line.includes('score cp')) {
-                const match = line.match(/score cp (-?\d+)/);
-                if (match) lastScore = parseInt(match[1], 10);
-            } else if (line.includes('score mate')) {
-                const match = line.match(/score mate (-?\d+)/);
-                if (match) {
-                    const mateIn = parseInt(match[1], 10);
-                    lastScore = mateIn > 0 ? 10000 - mateIn : -10000 - mateIn;
-                }
-            } else if (line.startsWith('bestmove')) {
-                cleanup();
-                if (!resolved) {
-                    resolved = true;
+        const onMessage = (event) => {
+            const line = typeof event === 'object' ? event.data : event;
+            if (typeof line === 'string') {
+                if (line.includes('score cp')) {
+                    const match = line.match(/score cp (-?\d+)/);
+                    if (match) lastScore = parseInt(match[1], 10);
+                } else if (line.includes('score mate')) {
+                    const match = line.match(/score mate (-?\d+)/);
+                    if (match) {
+                        const mateIn = parseInt(match[1], 10);
+                        lastScore = mateIn > 0 ? 10000 - mateIn : -10000 - mateIn;
+                    }
+                } else if (line.startsWith('bestmove')) {
+                    cleanup();
                     resolve(lastScore);
                 }
             }
         };
 
         const cleanup = () => {
-            if (typeof engine.removeListener === 'function') {
-                engine.removeListener('message', handleMessage);
-            }
-            if (typeof engine.off === 'function') {
-                engine.off('message', handleMessage);
-            }
-            if (engine.onmessage === handleMessage) {
-                engine.onmessage = null;
+            if (!resolved) {
+                resolved = true;
+                if (engine.removeListener) engine.removeListener('message', onMessage);
             }
         };
 
-        // Đăng ký nhận message linh hoạt
-        if (typeof engine.on === 'function') {
-            engine.on('message', handleMessage);
-        } else {
-            engine.onmessage = handleMessage;
+        if (engine.on) engine.on('message', onMessage);
+        else if (engine.onmessage !== undefined) engine.onmessage = onMessage;
+
+        try {
+            engine.postMessage(`position fen ${fen}`);
+            engine.postMessage(`go depth 6`);
+        } catch (err) {
+            cleanup();
+            resolve(0);
         }
 
-        // Timeout phòng hờ engine không trả về bestmove
-        const timer = setTimeout(() => {
+        // Timeout phòng hờ trường hợp engine phản hồi chậm
+        setTimeout(() => {
             cleanup();
-            if (!resolved) {
-                resolved = true;
-                resolve(lastScore);
-            }
-        }, 3000);
-
-        sendEngineCommand(`position fen ${fen}`);
-        sendEngineCommand(`go depth 6`);
+            resolve(lastScore);
+        }, 1500);
     });
 }
 
+// Phân loại nước đi theo chuẩn Chess.com
 async function classifyMove(gameBefore, moveObject, plyCount) {
     if (plyCount <= 8) {
         return { classification: "Book", description: "Nước đi khai cuộc chuẩn" };
