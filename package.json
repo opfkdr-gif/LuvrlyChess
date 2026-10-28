@@ -1,16 +1,20 @@
 {
-  "name": "express-hello-world",
+  "name": "luvrly-chess-server",
   "version": "1.0.0",
-  "description": "Express Hello World on Render",
-  "main": "app.js",
-  "repository": "https://github.com/render-examples/express-hello-world",
-  "author": "Render Developers",
-  "license": "MIT",
-  "private": false,
+  "description": "Realtime Chess Server with Stockfish evaluation and auto-ping for Render",
+  "main": "server.js",
   "scripts": {
-    "start": "node app.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   },
   "dependencies": {
-    "express": "^5.0.0"
+    "axios": "^1.6.8",
+    "chess.js": "^1.0.0-beta.6",
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5",
+    "stockfish": "^1.0.0"
   }
 }
