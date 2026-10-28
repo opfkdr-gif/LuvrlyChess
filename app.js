@@ -1,61 +1,237 @@
-const express = require("express");
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const { Chess } = require('chess.js');
+const stockfish = require('stockfish');
+const axios = require('axios');
+
+const PORT = process.env.PORT || 3000;
+const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+
+// ==========================================
+// URL RAW CỦA GITHUB GIST (GẮN TRỰC TIẾP TẠI ĐÂY)
+// Hãy thay thế đoạn link dưới bằng link Raw Gist thực tế của bạn
+// ==========================================
+const GIST_HTML_URL = 'https://gist.githubusercontent.com/opfkdr-gif/493574c699b41d7f35d5ce1da158a7db/raw/5ef6f4ea7399ee2265dd245b01b926300c8fa322/gistfile1.txt';
+
 const app = express();
-const port = process.env.PORT || 3001;
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: { origin: "*", methods: ["GET", "POST"] }
+});
 
-app.get("/", (req, res) => res.type('html').send(html));
+app.use(express.json());
 
-const server = app.listen(port, () => console.log(`Example app listening on port ${port}!`));
+// ==========================================
+// 0. TRANG DEFAULT: TẢI HTML TRỰC TIẾP TỪ GIST ĐÃ ĐẶT SẴN
+// ==========================================
+app.get('/', async (req, res) => {
+    try {
+        const response = await axios.get(GIST_HTML_URL);
+        res.setHeader('Content-Type', 'text/html');
+        res.status(200).send(response.data);
+    } catch (err) {
+        console.error('[Gist Loader Error]:', err.message);
+        res.status(500).send(`
+            <h2>Không thể tải giao diện từ GitHub Gist!</h2>
+            <p>Lỗi: ${err.message}</p>
+            <p>Vui lòng kiểm tra lại biến <code>GIST_HTML_URL</code> trong file <code>server.js</code> của bạn.</p>
+        `);
+    }
+});
 
-server.keepAliveTimeout = 120 * 1000;
-server.headersTimeout = 120 * 1000;
+// ==========================================
+// 1. AUTO PING ĐỂ CHỐNG SLEEP TRÊN RENDER
+// ==========================================
+app.get('/ping', (req, res) => {
+    res.status(200).send('OK - Server Active');
+});
 
-const html = `
-<!DOCTYPE html>
-<html>
-  <head>
-    <title>Hello from Render!</title>
-    <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.5.1/dist/confetti.browser.min.js"></script>
-    <script>
-      setTimeout(() => {
-        confetti({
-          particleCount: 100,
-          spread: 70,
-          origin: { y: 0.6 },
-          disableForReducedMotion: true
+setInterval(async () => {
+    try {
+        await axios.get(`${RENDER_EXTERNAL_URL}/ping`);
+        console.log(`[Self-Ping] Successfully pinged: ${RENDER_EXTERNAL_URL}/ping`);
+    } catch (err) {
+        console.error('[Self-Ping] Error:', err.message);
+    }
+}, 10 * 60 * 1000); // Mỗi 10 phút
+
+// ==========================================
+// 2. STOCKFISH ENGINE TỐI ƯU (CHỐNG OOM)
+// ==========================================
+const engine = stockfish();
+engine.postMessage('uci');
+engine.postMessage('setoption name Threads value 1');
+engine.postMessage('setoption name Hash value 8');
+engine.postMessage('isready');
+
+function getFenScore(fen) {
+    return new Promise((resolve) => {
+        let lastScore = 0;
+        const onMessage = (event) => {
+            const line = typeof event === 'object' ? event.data : event;
+            if (line.includes('score cp')) {
+                const match = line.match(/score cp (-?\d+)/);
+                if (match) lastScore = parseInt(match[1], 10);
+            } else if (line.includes('score mate')) {
+                const match = line.match(/score mate (-?\d+)/);
+                if (match) {
+                    const mateIn = parseInt(match[1], 10);
+                    lastScore = mateIn > 0 ? 10000 - mateIn : -10000 - mateIn;
+                }
+            } else if (line.startsWith('bestmove')) {
+                engine.removeListener('message', onMessage);
+                resolve(lastScore);
+            }
+        };
+        engine.onmessage = onMessage;
+        engine.postMessage(`position fen ${fen}`);
+        engine.postMessage(`go depth 6`);
+    });
+}
+
+async function classifyMove(gameBefore, moveObject, plyCount) {
+    if (plyCount <= 8) {
+        return { classification: "Book", description: "Nước đi khai cuộc chuẩn" };
+    }
+
+    const fenBefore = gameBefore.fen();
+    const tempGame = new Chess(fenBefore);
+    const turn = tempGame.turn();
+
+    const prevScore = await getFenScore(fenBefore);
+    tempGame.move(moveObject);
+    const fenAfter = tempGame.fen();
+    const newScore = await getFenScore(fenAfter);
+
+    let diff = (turn === 'w') ? (newScore - prevScore) : (prevScore - newScore);
+
+    let classification = "Good";
+    if (diff >= 150 && (moveObject.captured || moveObject.san.includes('+'))) {
+        classification = "Brilliant";
+    } else if (diff >= 50) {
+        classification = "Great Find";
+    } else if (diff >= -20) {
+        classification = "Best";
+    } else if (diff >= -80) {
+        classification = "Inaccuracy";
+    } else if (diff >= -200) {
+        classification = "Mistake";
+    } else {
+        classification = "Blunder";
+    }
+
+    return { classification, centipawnChange: diff };
+}
+
+// ==========================================
+// 3. MATCHMAKING & SOCKET.IO REALTIME
+// ==========================================
+let waitingPlayer = null;
+const rooms = new Map();
+
+io.on('connection', (socket) => {
+    console.log(`[Socket] Connected: ${socket.id}`);
+
+    socket.on('find_match', () => {
+        if (waitingPlayer && waitingPlayer.id !== socket.id) {
+            const roomId = `room_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+            const player1 = waitingPlayer;
+            const player2 = socket;
+
+            waitingPlayer = null;
+
+            const newGame = new Chess();
+            rooms.set(roomId, { game: newGame, players: { white: player1.id, black: player2.id } });
+
+            player1.join(roomId);
+            player2.join(roomId);
+
+            io.to(player1.id).emit('match_found', { roomId, color: 'white', fen: newGame.fen() });
+            io.to(player2.id).emit('match_found', { roomId, color: 'black', fen: newGame.fen() });
+        } else {
+            waitingPlayer = socket;
+            socket.emit('waiting_for_match', { message: 'Đang tìm đối thủ...' });
+        }
+    });
+
+    socket.on('create_custom_room', () => {
+        const roomId = `custom_${Math.floor(1000 + Math.random() * 9000)}`;
+        rooms.set(roomId, { game: new Chess(), players: { white: socket.id, black: null } });
+        socket.join(roomId);
+        socket.emit('custom_room_created', { roomId, color: 'white' });
+    });
+
+    socket.on('join_custom_room', (data) => {
+        const { roomId } = data;
+        const room = rooms.get(roomId);
+
+        if (room && !room.players.black) {
+            room.players.black = socket.id;
+            socket.join(roomId);
+
+            io.to(room.players.white).emit('match_found', { roomId, color: 'white', fen: room.game.fen() });
+            io.to(socket.id).emit('match_found', { roomId, color: 'black', fen: room.game.fen() });
+        } else {
+            socket.emit('error_message', 'Phòng không tồn tại hoặc đã đủ người!');
+        }
+    });
+
+    socket.on('make_move', async (data) => {
+        const { roomId, move } = data;
+        const room = rooms.get(roomId);
+
+        if (!room) return socket.emit('error_message', 'Phòng chơi không hợp lệ!');
+
+        const game = room.game;
+        const currentTurnColor = game.turn() === 'w' ? 'white' : 'black';
+
+        if (room.players[currentTurnColor] !== socket.id) {
+            return socket.emit('error_message', 'Chưa tới lượt của bạn!');
+        }
+
+        const gameBefore = new Chess(game.fen());
+
+        let moveResult = null;
+        try {
+            moveResult = game.move(move);
+        } catch (e) {
+            moveResult = null;
+        }
+
+        if (!moveResult) {
+            return socket.emit('invalid_move', { message: 'Nước đi không hợp lệ!', currentFen: game.fen() });
+        }
+
+        const plyCount = game.history().length;
+        const evaluation = await classifyMove(gameBefore, moveResult, plyCount);
+
+        io.to(roomId).emit('move_made', {
+            move: moveResult,
+            fen: game.fen(),
+            turn: game.turn(),
+            isCheck: game.inCheck(),
+            isGameOver: game.isGameOver(),
+            evaluation
         });
-      }, 500);
-    </script>
-    <style>
-      @import url("https://p.typekit.net/p.css?s=1&k=vnd5zic&ht=tk&f=39475.39476.39477.39478.39479.39480.39481.39482&a=18673890&app=typekit&e=css");
-      @font-face {
-        font-family: "neo-sans";
-        src: url("https://use.typekit.net/af/00ac0a/00000000000000003b9b2033/27/l?primer=7cdcb44be4a7db8877ffa5c0007b8dd865b3bbc383831fe2ea177f62257a9191&fvd=n7&v=3") format("woff2"), url("https://use.typekit.net/af/00ac0a/00000000000000003b9b2033/27/d?primer=7cdcb44be4a7db8877ffa5c0007b8dd865b3bbc383831fe2ea177f62257a9191&fvd=n7&v=3") format("woff"), url("https://use.typekit.net/af/00ac0a/00000000000000003b9b2033/27/a?primer=7cdcb44be4a7db8877ffa5c0007b8dd865b3bbc383831fe2ea177f62257a9191&fvd=n7&v=3") format("opentype");
-        font-style: normal;
-        font-weight: 700;
-      }
-      html {
-        font-family: neo-sans;
-        font-weight: 700;
-        font-size: calc(62rem / 16);
-      }
-      body {
-        background: white;
-      }
-      section {
-        border-radius: 1em;
-        padding: 1em;
-        position: absolute;
-        top: 50%;
-        left: 50%;
-        margin-right: -50%;
-        transform: translate(-50%, -50%);
-      }
-    </style>
-  </head>
-  <body>
-    <section>
-      Hello from Render!
-    </section>
-  </body>
-</html>
-`
+
+        if (game.isGameOver()) {
+            let reason = "Game Over";
+            if (game.isCheckmate()) reason = "Checkmate";
+            else if (game.isDraw()) reason = "Draw";
+
+            io.to(roomId).emit('game_over', { reason, winner: currentTurnColor });
+            rooms.delete(roomId);
+        }
+    });
+
+    socket.on('disconnect', () => {
+        if (waitingPlayer && waitingPlayer.id === socket.id) {
+            waitingPlayer = null;
+        }
+    });
+});
+
+server.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+});
