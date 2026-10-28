@@ -10,7 +10,6 @@ const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost
 
 // ==========================================
 // URL RAW CỦA GITHUB GIST (GẮN TRỰC TIẾP TẠI ĐÂY)
-// Hãy thay thế đoạn link dưới bằng link Raw Gist thực tế của bạn
 // ==========================================
 const GIST_HTML_URL = 'https://gist.githubusercontent.com/opfkdr-gif/493574c699b41d7f35d5ce1da158a7db/raw/5ef6f4ea7399ee2265dd245b01b926300c8fa322/gistfile1.txt';
 
@@ -35,7 +34,7 @@ app.get('/', async (req, res) => {
         res.status(500).send(`
             <h2>Không thể tải giao diện từ GitHub Gist!</h2>
             <p>Lỗi: ${err.message}</p>
-            <p>Vui lòng kiểm tra lại biến <code>GIST_HTML_URL</code> trong file <code>server.js</code> của bạn.</p>
+            <p>Vui lòng kiểm tra lại biến <code>GIST_HTML_URL</code> trong file <code>app.js</code> của bạn.</p>
         `);
     }
 });
@@ -57,19 +56,48 @@ setInterval(async () => {
 }, 10 * 60 * 1000); // Mỗi 10 phút
 
 // ==========================================
-// 2. STOCKFISH ENGINE TỐI ƯU (CHỐNG OOM)
+// 2. STOCKFISH ENGINE AN TOÀN (CHỐNG LỖI API & OOM)
 // ==========================================
-const engine = stockfish();
-engine.postMessage('uci');
-engine.postMessage('setoption name Threads value 1');
-engine.postMessage('setoption name Hash value 8');
-engine.postMessage('isready');
+let engine;
+try {
+    engine = stockfish();
+} catch (e) {
+    console.error('[Stockfish Init Error]:', e.message);
+}
+
+// Hàm gửi lệnh linh hoạt tương thích với mọi phiên bản gói stockfish
+const sendEngineCommand = (cmd) => {
+    if (!engine) return;
+    if (typeof engine.postMessage === 'function') {
+        engine.postMessage(cmd);
+    } else if (typeof engine.send === 'function') {
+        engine.send(cmd);
+    } else if (typeof engine.write === 'function') {
+        engine.write(cmd + '\n');
+    } else {
+        console.warn('[Stockfish] Không tìm thấy phương thức gửi lệnh hợp lệ.');
+    }
+};
+
+if (engine) {
+    sendEngineCommand('uci');
+    sendEngineCommand('setoption name Threads value 1');
+    sendEngineCommand('setoption name Hash value 8');
+    sendEngineCommand('isready');
+}
 
 function getFenScore(fen) {
     return new Promise((resolve) => {
+        if (!engine) {
+            return resolve(0);
+        }
+
         let lastScore = 0;
-        const onMessage = (event) => {
-            const line = typeof event === 'object' ? event.data : event;
+        let resolved = false;
+
+        const handleMessage = (data) => {
+            const line = typeof data === 'object' && data !== null ? (data.data || JSON.stringify(data)) : String(data);
+
             if (line.includes('score cp')) {
                 const match = line.match(/score cp (-?\d+)/);
                 if (match) lastScore = parseInt(match[1], 10);
@@ -80,13 +108,44 @@ function getFenScore(fen) {
                     lastScore = mateIn > 0 ? 10000 - mateIn : -10000 - mateIn;
                 }
             } else if (line.startsWith('bestmove')) {
-                engine.removeListener('message', onMessage);
-                resolve(lastScore);
+                cleanup();
+                if (!resolved) {
+                    resolved = true;
+                    resolve(lastScore);
+                }
             }
         };
-        engine.onmessage = onMessage;
-        engine.postMessage(`position fen ${fen}`);
-        engine.postMessage(`go depth 6`);
+
+        const cleanup = () => {
+            if (typeof engine.removeListener === 'function') {
+                engine.removeListener('message', handleMessage);
+            }
+            if (typeof engine.off === 'function') {
+                engine.off('message', handleMessage);
+            }
+            if (engine.onmessage === handleMessage) {
+                engine.onmessage = null;
+            }
+        };
+
+        // Đăng ký nhận message linh hoạt
+        if (typeof engine.on === 'function') {
+            engine.on('message', handleMessage);
+        } else {
+            engine.onmessage = handleMessage;
+        }
+
+        // Timeout phòng hờ engine không trả về bestmove
+        const timer = setTimeout(() => {
+            cleanup();
+            if (!resolved) {
+                resolved = true;
+                resolve(lastScore);
+            }
+        }, 3000);
+
+        sendEngineCommand(`position fen ${fen}`);
+        sendEngineCommand(`go depth 6`);
     });
 }
 
