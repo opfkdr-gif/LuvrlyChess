@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 
 // URL Raw của GitHub Gist chứa giao diện HTML của bạn
-const GIST_HTML_URL = 'https://gist.githubusercontent.com/opfkdr-gif/493574c699b41d7f35d5ce1da158a7db/raw/92c5f0c36e601266e8bb978a816d36d2e72a0b3b/gistfile1.txt';
+const GIST_HTML_URL = 'https://gist.githubusercontent.com/opfkdr-gif/493574c699b41d7f35d5ce1da158a7db/raw/f1eb6879c4323e67409ecd6ede76497d92b316e6/gistfile1.txt';
 
 const app = express();
 const server = http.createServer(app);
